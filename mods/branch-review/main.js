@@ -16,22 +16,27 @@ const BASES = ["origin/main", "main", "origin/master", "master"];
 const MAX_LINES = 3000;
 const MAX_UNTRACKED = 100;
 const PAGE = 15;
-const SECTIONS = ["commits", "files", "diff"];
 const CONTEXT = 3, STEP = 20, FULL = 1000000;
-const ROW = 20, MORE = 24, THREAD = 22, GH_ROW = 46;
+const ROW = 20, MORE = 24, THREAD = 22, GH_ROW = 46, LIST_ROW = 22;
 const GH_POLL = 5 * 60 * 1000;
 const ICON = (name) => `mods/branch-review/${name}.svg`;
 // Comment prose reads better in the UI font than in the diff's code font.
 const UI_FONT = () => settings().ui_font ?? settings().ui_font_family ?? "Geist";
-const SCOPES = [["branch", "b"], ["last", "l"], ["uncommitted", "u"]];
+const CODE_FONT = () => settings().font_family ?? "JetBrains Mono";
+const SCOPES = ["branch", "last", "uncommitted"];
+// The side panels, as in lazygit: a number key jumps to each. The main panel (the diff, or the
+// selected GitHub thread) is "diff", on 0.
+const PANELS = [["scope", "1", "Scope"], ["files", "2", "Files"], ["commits", "3", "Commits"], ["github", "4", "GitHub"]];
 
-const KEYS = [
-  ["Move", [["j k", "down / up"], ["ctrl-d ctrl-u", "page"], ["gg G", "top / bottom"], ["tab", "next section"]]],
-  ["Comment", [["c ↩", "comment on the line (or edit)"], ["v", "select lines, then c"], ["C", "comment on the whole file"], ["x U", "delete the comment / undo"]]],
-  ["Ask & send", [["a", "ask about the line, selection or file"], ["s", "send the review"], ["t", "next recipient"]]],
-  ["View", [["b l u", "branch / last commit / uncommitted"], ["e E", "more context / whole file"], ["p", "GitHub threads"], ["r", "refresh"], ["q", "close"]]],
-];
-const GH_KEYS = [["j k", "move"], ["↩", "show in diff"], ["f", "fix: send to agent"], ["i", "add to / remove from review"], ["R", "reply on GitHub"], ["o", "open in browser"], ["H", "show resolved"], ["p", "back to the diff"]];
+// Keys per panel, for the bottom bar (the first few) and the ? popup (all of them).
+const GLOBAL_KEYS = [["1-4 0", "jump to a panel"], ["h l / tab", "previous / next panel"], ["[ ]", "previous / next scope"], ["s", "send the review"], ["t", "next recipient"], ["r", "refresh"], ["?", "keys"], ["q", "close"]];
+const PANEL_KEYS = {
+  scope: [["j k", "pick a scope"], ["b u", "branch / uncommitted"], ["enter", "go to files"]],
+  files: [["j k", "pick a file"], ["enter", "go to the diff"], ["c", "comment on the file"], ["a", "ask about the file"], ["e E", "more context / whole file"]],
+  commits: [["j k", "move"], ["enter", "show this commit (again: back)"], ["shift-enter", "show the range to here"], ["v", "pick a range, then enter"]],
+  github: [["j k", "pick a thread"], ["enter", "show in diff"], ["f", "fix: send to agent"], ["i", "add to / remove from review"], ["R", "reply on GitHub"], ["o O", "open thread / PR"], ["H", "show resolved"]],
+  diff: [["c enter", "comment (or edit)"], ["v", "pick lines, then c"], ["a", "ask"], ["C", "comment on the file"], ["x U", "delete / undo"], ["e E", "more context / whole file"], ["ctrl-d ctrl-u", "page"], ["gg G", "top / bottom"], ["esc", "back to the panel"]],
+};
 
 // The folder this pane reviews: its props from the opener, else the focused pane's.
 function startFolder() {
@@ -58,6 +63,8 @@ const ago = (iso) => {
   return s < 90 ? "now" : s < 5400 ? `${Math.round(s / 60)}m` : s < 129600 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
 };
 const split = (path) => { const i = path.lastIndexOf("/"); return i < 0 ? ["", path] : [path.slice(0, i + 1), path.slice(i + 1)]; };
+// A theme color at an alpha. Colors can already carry one (#rrggbbaa), so that one is replaced.
+const tint = (c, a) => (typeof c === "string" && c.length === 9 ? c.slice(0, 7) : c) + a;
 const STATUS = { A: "ansi2", U: "ansi2", D: "ansi1", M: "blocked", R: "accent", T: "dim" };
 
 export default class BranchReview extends View {
@@ -69,10 +76,12 @@ export default class BranchReview extends View {
     this.commits = []; this.files = []; this.rows = []; this.comments = [];
     this.open = null; this.editing = null; this.target = null; this.gen = 0;
     this.ctx = new Map(); this.place = { at: new Map(), outdated: new Set() };
-    this.cursor = 0; this.commitCursor = 0; this.section = "diff"; this.view = "diff"; this.pending = null;
+    // section: the focused panel. side: the last side panel focused, which picks what the main panel shows.
+    this.cursor = 0; this.commitCursor = 0; this.section = "files"; this.side = "files"; this.pending = null;
     this.visual = null; this.vrow = null;
     this.threads = []; this.pr = null; this.gh = "idle"; this.ghCursor = 0; this.showResolved = false; this.seen = {};
     this.width = 800;
+    this.layout = { left: null, weights: {} }; this.heights = {}; this.drag = null;
     this.handle = cx.focus_handle();
     this.scroll = VirtualListScrollHandle.new();
     this.commitScroll = VirtualListScrollHandle.new();
@@ -109,6 +118,10 @@ export default class BranchReview extends View {
     });
   }
 
+  // What the main panel shows: the GitHub panel's thread, or the diff of the picked file.
+  get view() { return this.side === "github" ? "github" : "diff"; }
+  set view(v) { if (v === "github") this.side = "github"; else if (this.side === "github") this.side = "files"; }
+
   // ---- git ---------------------------------------------------------------------------------------
 
   git(args) { return exec("git", [...READ, ...args], { cwd: this.root, on: this.on }); }
@@ -120,6 +133,12 @@ export default class BranchReview extends View {
   runGh(args) { return exec("gh", args, { cwd: this.root, on: this.on }); }
 
   storeKey() { return `comments:${this.root}:${this.branch}`; }
+  // Splitter sizes, kept per repo: the side column's width and the side panels' shares of its height.
+  loadLayout() {
+    try { Object.assign(this.layout, JSON.parse(localStorage.getItem(`layout:${this.root}`) ?? "{}")); } catch {}
+  }
+  saveLayout() { try { localStorage.setItem(`layout:${this.root}`, JSON.stringify(this.layout)); } catch {} }
+
   loadComments() {
     try { this.comments = JSON.parse(localStorage.getItem(this.storeKey()) ?? "[]").map(R.migrate); } catch { this.comments = []; }
     try { this.seen = JSON.parse(localStorage.getItem(`gh-seen:${this.root}`) ?? "{}"); } catch { this.seen = {}; }
@@ -146,7 +165,7 @@ export default class BranchReview extends View {
           const newRoot = root !== this.root;
           this.root = root; this.branch = branch; this.base = null; this.pr = null; this.threads = []; this.gh = "idle";
           this.scope = { kind: "branch" }; this.open = null; this.editing = null; this.ctx = new Map();
-          this.loadComments();
+          this.loadComments(); this.loadLayout();
           if (newRoot) this.watch(cx);
         }
         if (!this.base) this.base = await this.findBase();
@@ -585,16 +604,34 @@ export default class BranchReview extends View {
   markSeen(t) { if (t && this.isNew(t)) { this.seen[t.id] = t.version; this.saveSeen(); } }
   queued(t) { return this.comments.some((c) => c.kind === "github" && c.thread?.id === t.id); }
 
-  toggleView(cx) {
-    this.view = this.view === "github" ? "diff" : "github";
-    if (this.view === "github") { this.markSeen(this.shownThreads()[this.ghCursor]); if (this.gh === "idle" || this.gh === "none") this.loadThreads(cx); }
+  // p: the GitHub panel, or back to Files from it.
+  toggleView(cx) { this.focusPanel(this.view === "github" ? "files" : "github", cx); }
+
+  // The GitHub panel shows once there is a pull request or a gh problem to report, or when asked for.
+  hasGithub() { return Boolean(this.pr) || this.gh === "error" || this.side === "github"; }
+
+  focusPanel(name, cx) {
+    if (name === "github" && this.side !== "github") {
+      this.markSeen(this.shownThreads()[this.ghCursor]);
+      if (this.gh === "idle" || this.gh === "none") this.loadThreads(cx);
+    }
+    if (name !== "diff") this.side = name;
+    if (name !== this.section) { this.visual = null; this.vrow = null; }
+    this.section = name;
     cx.notify();
+  }
+
+  // h / l and tab: the side panels in order, then the main panel.
+  cyclePanel(delta, cx) {
+    const order = [...PANELS.filter(([name]) => name !== "github" || this.hasGithub()).map(([name]) => name), "diff"];
+    const i = Math.max(0, order.indexOf(this.section));
+    this.focusPanel(order[(i + delta + order.length) % order.length], cx);
   }
 
   showThread(t, cx) {
     const i = this.shownThreads().findIndex((x) => x.id === t.id);
     if (i >= 0) this.ghCursor = i;
-    this.view = "github"; this.markSeen(t);
+    this.side = "github"; this.section = "github"; this.markSeen(t);
     this.ghScroll.scroll_to_item(this.ghCursor);
     cx.notify();
   }
@@ -602,7 +639,7 @@ export default class BranchReview extends View {
   // The thread's line in the diff, when this file and line are in the branch view.
   jumpToThread(t, cx) {
     if (!t) return;
-    this.view = "diff";
+    this.side = "files"; this.section = "diff";
     if (this.scope.kind !== "branch") this.setScope({ kind: "branch" }, cx);
     const go = (cx) => {
       const i = this.display?.findIndex((d) => d.thread?.id === t.id) ?? -1;
@@ -662,14 +699,36 @@ export default class BranchReview extends View {
   // ---- keys --------------------------------------------------------------------------------------
 
   // Not named close(): Herdr calls a view's close() when its pane goes away.
-  // Only ever closes a branch-review pane, never the focused pane by default.
+  // Only ever closes a branch-review pane, never the focused pane by default. Alone in its tab
+  // (as ctrl-b shift-v opens it), it closes the tab; in a split, only its pane.
   closePane() {
-    const me = panes().find((p) => p.mod === "branch-review" && p.focused);
-    if (me) run("pane.close", { pane: me.pane });
+    const all = panes(), me = all.find((p) => p.mod === "branch-review" && p.focused);
+    if (!me) return;
+    const alone = me.tab && all.filter((p) => p.tab === me.tab).length === 1;
+    if (alone) run("tab.close", { id: me.tab });
+    else run("pane.close", { pane: me.pane });
   }
 
+  // The Scope panel's rows: the three scopes, and the picked commits while they're shown.
+  scopeItems() {
+    const items = SCOPES.map((kind) => ({ kind }));
+    if (this.scope.kind === "commits") items.push(this.scope);
+    return items;
+  }
+  scopeIndex() { return Math.max(0, this.scopeItems().findIndex((s) => s.kind === this.scope.kind)); }
+
+  // [ and ]: the three scopes in turn.
+  cycleScope(delta, cx) {
+    const i = SCOPES.indexOf(this.scope.kind);
+    const next = i < 0 ? (delta > 0 ? 0 : SCOPES.length - 1) : (i + delta + SCOPES.length) % SCOPES.length;
+    this.setScope({ kind: SCOPES[next] }, cx);
+  }
+
+  // j / k move in the GitHub list from its panel and from the thread it shows.
+  onThreads() { return this.section === "github" || (this.section === "diff" && this.view === "github"); }
+
   moveTo(to, cx) {
-    if (this.view === "github") {
+    if (this.onThreads()) {
       const n = this.shownThreads().length;
       if (!n) return;
       this.ghCursor = Math.max(0, Math.min(n - 1, to));
@@ -685,6 +744,11 @@ export default class BranchReview extends View {
       this.scroll.scroll_to_item(this.cursor);
       return cx.notify();
     }
+    if (this.section === "scope") {
+      const items = this.scopeItems(), s = items[Math.max(0, Math.min(items.length - 1, to))];
+      if (s.kind !== this.scope.kind) this.setScope(s, cx);
+      return cx.notify();
+    }
     if (this.section === "commits") {
       if (!this.commits.length) return;
       this.commitCursor = Math.max(0, Math.min(this.commits.length - 1, to));
@@ -698,17 +762,11 @@ export default class BranchReview extends View {
   }
 
   position() {
-    if (this.view === "github") return this.ghCursor;
+    if (this.onThreads()) return this.ghCursor;
+    if (this.section === "scope") return this.scopeIndex();
     if (this.section === "commits") return this.commitCursor;
     if (this.section === "files") return Math.max(0, this.files.findIndex((f) => f.path === this.open));
     return this.cursor;
-  }
-
-  cycleSection(delta, cx) {
-    this.visual = null; this.vrow = null;
-    const i = SECTIONS.indexOf(this.section);
-    this.section = SECTIONS[(i + delta + SECTIONS.length) % SECTIONS.length];
-    cx.notify();
   }
 
   // v: in Commits it starts a commit selection; in the diff, a line selection.
@@ -722,7 +780,8 @@ export default class BranchReview extends View {
   }
 
   enter(shift, cx) {
-    if (this.view === "github") return this.jumpToThread(this.shownThreads()[this.ghCursor], cx);
+    if (this.onThreads()) return this.jumpToThread(this.shownThreads()[this.ghCursor], cx);
+    if (this.section === "scope") return this.focusPanel("files", cx);
     if (this.section === "commits" && this.visual != null) {
       const [lo, hi] = [Math.min(this.visual, this.commitCursor), Math.max(this.visual, this.commitCursor)];
       this.visual = null;
@@ -731,7 +790,7 @@ export default class BranchReview extends View {
     } else if (this.section === "commits") {
       const c = this.commits[this.commitCursor];
       if (c) this.clickCommit(c.sha, { modifiers: { shift } }, cx);
-    } else if (this.section === "files") { this.section = "diff"; cx.notify(); }
+    } else if (this.section === "files") this.focusPanel("diff", cx);
     else this.comment(cx);
   }
 
@@ -771,14 +830,20 @@ export default class BranchReview extends View {
     const pending = this.pending;
     this.pending = null;
     const t = this.shownThreads()[this.ghCursor];
-    const gh = this.view === "github" ? {
+    const none = () => {};
+    const gh = this.onThreads() ? {
       "f": () => this.fixThread(t, cx), "i": () => this.toggleQueued(t, cx), "R": () => this.startReply(t, cx),
-      "o": () => t?.url && exec("open", [t.url]),
+      "o": () => t?.url && exec("open", [t.url]), "O": () => this.pr?.url && exec("open", [this.pr.url]),
       "H": () => { this.showResolved = !this.showResolved; this.ghCursor = 0; cx.notify(); },
-      "tab": () => {}, "shift-tab": () => {}, "c": () => {}, "C": () => {}, "v": () => {}, "x": () => {}, "a": () => {}, "e": () => {}, "E": () => {},
+      "c": none, "C": none, "v": none, "x": none, "a": none, "e": none, "E": none,
     } : {};
     const act = {
-      "tab": () => this.cycleSection(1, cx), "shift-tab": () => this.cycleSection(-1, cx),
+      "tab": () => this.cyclePanel(1, cx), "shift-tab": () => this.cyclePanel(-1, cx),
+      "l": () => this.cyclePanel(1, cx), "h": () => this.cyclePanel(-1, cx),
+      "right": () => this.cyclePanel(1, cx), "left": () => this.cyclePanel(-1, cx),
+      "1": () => this.focusPanel("scope", cx), "2": () => this.focusPanel("files", cx), "3": () => this.focusPanel("commits", cx),
+      "4": () => this.focusPanel("github", cx), "0": () => this.focusPanel("diff", cx),
+      "[": () => this.cycleScope(-1, cx), "]": () => this.cycleScope(1, cx),
       "j": () => this.moveTo(this.position() + 1, cx), "down": () => this.moveTo(this.position() + 1, cx),
       "k": () => this.moveTo(this.position() - 1, cx), "up": () => this.moveTo(this.position() - 1, cx),
       "ctrl-d": () => this.moveTo(this.position() + PAGE, cx), "ctrl-u": () => this.moveTo(this.position() - PAGE, cx),
@@ -790,11 +855,10 @@ export default class BranchReview extends View {
         if (this.showHelp) this.showHelp = false;
         else if (this.vrow != null) this.vrow = null;
         else if (this.visual != null) this.visual = null;
-        else if (this.view === "github") this.view = "diff";
+        else if (this.section === "diff") this.section = this.side;
         cx.notify();
       },
       "b": () => this.setScope({ kind: "branch" }, cx),
-      "l": () => this.setScope({ kind: "last" }, cx),
       "u": () => this.setScope({ kind: "uncommitted" }, cx),
       "c": () => this.comment(cx),
       "C": () => this.startFile(this.open, cx),
@@ -812,7 +876,9 @@ export default class BranchReview extends View {
       "?": () => { this.showHelp = !this.showHelp; cx.notify(); },
       ...gh,
     };
-    const named = ["tab", "shift-tab", "enter", "shift-enter", "down", "up", "escape"];
+    // While the keys popup is open, only Esc and ? reach the pane.
+    if (this.showHelp && k !== "escape" && ch !== "?") { cx.stop_propagation(); return; }
+    const named = ["tab", "shift-tab", "enter", "shift-enter", "down", "up", "left", "right", "escape"];
     const fn = act[k.startsWith("ctrl-") || named.includes(k) ? k : ch];
     if (fn) { cx.stop_propagation(); fn(); }
   }
@@ -820,7 +886,7 @@ export default class BranchReview extends View {
   // ---- drawing -----------------------------------------------------------------------------------
 
   // Characters per line of a comment card's text, from the pane's width.
-  cardWidth() { return Math.max(240, Math.min(760, this.width - 70)); }
+  cardWidth() { return Math.max(240, Math.min(760, this.mainWidth() - 70)); }
   commentHeight(c, outdated = false) {
     const lines = Math.min(12, R.wrappedLines(c.text, (this.cardWidth() - 20) / 6.6));
     return 42 + lines * 16 + (outdated ? 16 : 0);
@@ -874,20 +940,12 @@ export default class BranchReview extends View {
 
   iconButton(id, icon, label, t, onClick, { active = false, title } = {}) {
     return h_flex().id(id).h(22).px(7).gap(5).flex_none().items_center().rounded(5).cursor_pointer().text_size(11)
-      .text_color(active ? t.accent : t.muted).when(active, (e) => e.bg(t.accent + "1f"))
+      .text_color(active ? t.accent : t.muted).when(active, (e) => e.bg(tint(t.accent, "1f")))
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
       .when(Boolean(title), (e) => e.tooltip(title))
       .on_click(onClick)
       .child(svg(ICON(icon)).size(12).flex_none())
       .when(Boolean(label), (e) => e.child(label));
-  }
-
-  chip(id, text, active, t, onClick, hint) {
-    return h_flex().id(id).h(24).px(10).gap(6).flex().flex_none().items_center().rounded(6).cursor_pointer().text_size(11.5)
-      .bg(active ? t.selected : t.raised).text_color(active ? t.foreground : t.muted).hover((s) => s.bg(t.hover))
-      .border_1().border_color(active ? t.accent + "66" : "#00000000")
-      .on_click(onClick).child(text)
-      .when(Boolean(hint), (e) => e.child(div().text_size(10).text_color(t.dim).child(hint)));
   }
 
   commentCard(item, t, index) {
@@ -908,14 +966,14 @@ export default class BranchReview extends View {
           .when(stale, (e) => e.child(div().text_color(t.dim).child("· sent with the code you saw"))))
         .child(div().w_full().text_size(12).line_height("16px").text_color(t.foreground).whitespace_normal().child(c.text))
         .when(stale && c.lines?.length, (e) => e.child(div().text_size(10.5).text_color(t.dim).truncate()
-          .font_family(settings().font_family ?? "JetBrains Mono").child(`was: ${c.lines.map((l) => l.text.trim()).join(" ⏎ ")}`))));
+          .font_family(CODE_FONT()).child(`was: ${c.lines.map((l) => l.text.trim()).join(" ⏎ ")}`))));
   }
 
   threadRow(item, t, index) {
     const th = item.thread, at = index === this.cursor && this.focusedHere && this.section === "diff";
     const first = th.comments[0], more = th.comments.length - 1;
     return h_flex().id(`th-${th.id}`).w_full().h(THREAD).flex_none().gap(8).items_center().cursor_pointer()
-      .bg(t.ansi4 + "14").hover((s) => s.bg(t.ansi4 + "26"))
+      .bg(tint(t.ansi4, "14")).hover((s) => s.bg(tint(t.ansi4, "26")))
       .child(this.marker(at, t))
       .child(div().w(76).flex_none())
       .child(svg(ICON("github")).size(12).flex_none().text_color(t.ansi4))
@@ -933,7 +991,7 @@ export default class BranchReview extends View {
     const { row, ri } = item;
     if (row.kind === "more") {
       const label = row.at === "top" ? "Show lines above" : row.at === "bottom" ? "Show lines below" : "Show hidden lines";
-      return h_flex().id(`m-${ri}`).w_full().h(MORE).flex_none().gap(8).items_center().cursor_pointer().bg(t.raised + "88").text_color(t.dim).text_size(10.5)
+      return h_flex().id(`m-${ri}`).w_full().h(MORE).flex_none().gap(8).items_center().cursor_pointer().bg(tint(t.raised, "88")).text_color(t.dim).text_size(10.5)
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
         .child(this.marker(atCursor, t)).child(div().w(76).flex_none().text_right().child("⋯"))
         .child(svg(ICON("expand")).size(11)).child(`${label} (${STEP} more · e, or E for the whole file)`);
@@ -947,11 +1005,11 @@ export default class BranchReview extends View {
     const covered = this.covered?.has(ri);
     const sign = row.kind === "+" ? t.ansi2 : row.kind === "-" ? t.ansi1 : t.dim;
     return h_flex().id(`r-${ri}`).w_full().h(ROW).flex_none().gap(8).cursor_pointer()
-      .when(row.kind === "+", (e) => e.bg(t.ansi2 + "18")).when(row.kind === "-", (e) => e.bg(t.ansi1 + "18"))
+      .when(row.kind === "+", (e) => e.bg(tint(t.ansi2, "18"))).when(row.kind === "-", (e) => e.bg(tint(t.ansi1, "18")))
       .when(Boolean(picked), (e) => e.bg(t.accent + (visual ? "40" : "33")))
       .when(atCursor && !picked, (e) => e.bg(t.selected))
       .hover((s) => s.bg(t.hover))
-      .child(this.marker(atCursor || picked || covered, t, atCursor ? t.accent : picked ? t.accent : t.accent + "66"))
+      .child(this.marker(atCursor || picked || covered, t, atCursor ? t.accent : picked ? t.accent : tint(t.accent, "66")))
       .child(div().w(32).flex_none().text_right().text_color(picked ? t.foreground : t.dim).child(row.old == null ? "" : String(row.old)))
       .child(div().w(36).flex_none().text_right().text_color(picked ? t.foreground : t.dim).child(row.next == null ? "" : String(row.next)))
       .child(div().w(10).flex_none().text_color(sign).child(row.kind.trim()))
@@ -962,202 +1020,165 @@ export default class BranchReview extends View {
 
   // ---- regions -----------------------------------------------------------------------------------
 
-  header(t) {
-    const pr = this.pr, open = this.threads.filter((x) => !x.isResolved), fresh = open.filter((x) => this.isNew(x)).length;
-    return h_flex().h(40).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
-      .child(div().font_semibold().text_size(13).child("Review"))
-      .child(h_flex().min_w(0).gap(5).items_center().text_color(t.muted)
-        .child(svg(ICON("git-branch")).size(12).flex_none())
-        .child(div().min_w(0).truncate().child(this.branch ? `${this.branch} → ${this.base ?? "?"}` : this.loading ? "Loading…" : "")))
-      .child(div().flex_1())
-      // Diff | GitHub
-      .when(Boolean(pr) || this.gh === "error", (e) => e.child(h_flex().h(26).p(2).gap(2).rounded(7).bg(t.raised).flex_none()
-        .child(h_flex().id("v-diff").h_full().px(9).items_center().rounded(5).cursor_pointer().text_size(11.5)
-          .when(this.view === "diff", (e) => e.bg(t.background).text_color(t.foreground)).when(this.view !== "diff", (e) => e.text_color(t.muted))
-          .on_click((_e, cx) => { if (this.view !== "diff") this.toggleView(cx); }).child("Diff"))
-        .child(h_flex().id("v-gh").h_full().px(9).gap(5).items_center().rounded(5).cursor_pointer().text_size(11.5)
-          .when(this.view === "github", (e) => e.bg(t.background).text_color(t.foreground)).when(this.view !== "github", (e) => e.text_color(t.muted))
-          .tooltip(pr ? `PR #${pr.number}: ${pr.title} (p)` : "GitHub (p)")
-          .on_click((_e, cx) => { if (this.view !== "github") this.toggleView(cx); })
-          .child(svg(ICON("github")).size(12))
-          .child(pr ? `#${pr.number}` : "GitHub")
-          .when(open.length > 0, (e) => e.child(div().text_size(10.5).text_color(t.dim).child(String(open.length))))
-          .when(fresh > 0, (e) => e.child(div().size(6).rounded(3).bg(t.accent))))))
-      .child(this.iconButton("br-refresh", "refresh", "Refresh", t, (_e, cx) => { this.refresh(cx, true); this.gh = this.gh === "loading" ? "loading" : "ready"; this.loadThreads(cx); }, { title: "Refresh (r)" }))
-      .child(this.iconButton("br-help", "help", "Keys", t, (_e, cx) => { this.showHelp = !this.showHelp; cx.notify(); }, { active: this.showHelp, title: "Keys (?)" }));
+  // The side column takes about a third of the pane until its splitter is dragged; the main panel the rest.
+  leftWidth() {
+    const auto = Math.max(240, Math.min(440, this.width * 0.32));
+    return Math.round(Math.max(180, Math.min(this.width - 320, this.layout.left ?? auto)));
+  }
+  mainWidth() { return Math.max(300, this.width - this.leftWidth() - 14); }
+
+  // A lazygit box: a border (accent while focused) with "[n] Title" set into its top edge. The edge is
+  // drawn in pieces around the title, so nothing has to paint over it (the background can be see-through).
+  panel(name, key, title, t, body, { grow = true, right = null } = {}) {
+    const on = this.section === name, c = on ? t.accent : tint(t.dim, "99");
+    const edge = () => div().flex_1().min_w(4).h(8).border_t(1).border_color(c);
+    return v_flex().id(`panel-${name}`).min_h(0)
+      .when(grow, (e) => e.flex_1().flex_grow(this.layout.weights[name] ?? 1)).when(!grow, (e) => e.flex_none())
+      .on_size_change((size) => { this.heights[name] = size?.height ?? 0; })
+      .on_mouse_down("left", (_e, cx) => { if (!this.typing && this.section !== name) this.focusPanel(name, cx); })
+      .child(h_flex().h(14).flex_none().items_end()
+        .child(div().w(8).h(8).flex_none().border_t(1).border_l(1).rounded_tl(5).border_color(c))
+        .child(h_flex().h(14).flex_none().px(4).gap(5).items_center().text_size(11.5)
+          .when(Boolean(key), (e) => e.child(div().text_color(on ? t.accent : t.dim).child(`[${key}]`)))
+          .child(div().max_w(this.width * 0.4).truncate().font_medium().text_color(on ? t.accent : t.muted).child(title)))
+        .child(edge())
+        .when(Boolean(right), (e) => e.child(div().h(14).flex_shrink(1).min_w(0).max_w(320).px(4).text_size(11).text_color(t.dim).truncate().child(right)))
+        .child(div().w(8).h(8).flex_none().border_t(1).border_r(1).rounded_tr(5).border_color(c)))
+      .child(v_flex().flex_1().min_h(0).pt(2).pb(2).px(2).border_l(1).border_r(1).border_b(1).rounded_b(5).border_color(c).overflow_hidden().child(body));
   }
 
-  help(t) {
-    const group = ([name, keys]) => v_flex().gap(3).min_w(180)
-      .child(div().text_size(10.5).font_semibold().text_color(t.dim).child(name.toUpperCase()))
-      .children(keys.map(([k, d]) => h_flex().gap(8).items_center()
-        .child(h_flex().w(84).flex_none().gap(3).children(k.split(" ").map((x) => div().px(4).rounded(3).border_1().border_color(t.border).bg(t.raised).text_size(10.5).child(x))))
-        .child(div().text_size(11).text_color(t.muted).child(d))));
-    const groups = this.view === "github" ? [["GitHub", GH_KEYS]] : KEYS;
-    return h_flex().flex_none().flex_wrap().gap_x(24).gap_y(10).px(14).py(10).border_b(1).border_color(t.border).bg(t.surface).children(groups.map(group));
+  // A splitter: drag it to resize. "col" sits between the side column and the main panel; "row" between two side panels.
+  splitter(kind, t, a = null, b = null) {
+    const id = kind === "col" ? "split-col" : `split-${a}-${b}`, active = this.drag?.id === id;
+    return div().id(id).flex_none().when(kind === "col", (e) => e.w(6).h_full().cursor_col_resize()).when(kind === "row", (e) => e.h(5).w_full().cursor_row_resize())
+      .child(div().when(kind === "col", (e) => e.w(2).h_full().mx(2)).when(kind === "row", (e) => e.h(2).w_full().my(1.5)).rounded(1)
+        .when(active, (e) => e.bg(t.accent)))
+      .hover((s) => s.bg(tint(t.accent, "33")))
+      .on_mouse_down("left", (e, cx) => {
+        cx.stop_propagation();
+        const at = e?.position ?? { x: 0, y: 0 };
+        if (kind === "col") this.drag = { id, kind, x: at.x, from: this.leftWidth() };
+        else {
+          // Shares become pixel heights while dragging, so the two panels trade exactly what the pointer moved.
+          for (const [n, h] of Object.entries(this.heights)) if (n !== "scope" && h > 0) this.layout.weights[n] = h;
+          this.drag = { id, kind, y: at.y, a, b, ha: this.heights[a] ?? 100, hb: this.heights[b] ?? 100 };
+        }
+        cx.notify();
+      });
   }
 
-  scopes(t) {
-    const shas = this.scope.kind === "commits" ? this.scope.shas : [];
+  dragTo(e, cx) {
+    const d = this.drag, at = e?.position;
+    if (!d || !at) return;
+    if (d.kind === "col") { this.layout.left = Math.round(d.from + at.x - d.x); this.layout.left = this.leftWidth(); }
+    else {
+      const total = d.ha + d.hb, ha = Math.max(60, Math.min(total - 60, d.ha + at.y - d.y));
+      this.layout.weights[d.a] = ha; this.layout.weights[d.b] = total - ha;
+    }
+    cx.notify();
+  }
+
+  endDrag(cx) {
+    if (!this.drag) return;
+    this.drag = null; this.saveLayout(); cx.notify();
+  }
+
+  // The row look shared by the side panels: the picked row is `selected` in the focused panel, `raised` otherwise.
+  listRow(id, picked, on, t) {
+    return h_flex().id(id).h(LIST_ROW).flex_none().pr(8).gap(8).items_center().rounded(3).cursor_pointer()
+      .when(picked, (e) => e.bg(on ? t.selected : t.raised)).hover((s) => s.bg(t.hover))
+      .child(this.marker(picked && on, t));
+  }
+
+  note(text, t, color = t.dim) { return div().px(8).py(4).text_size(11.5).text_color(color).whitespace_normal().child(text); }
+
+  scopePanel(t) {
+    const on = this.section === "scope" && this.focusedHere;
     const names = { branch: `Branch vs ${this.base ?? "base"}`, last: "Last commit", uncommitted: "Uncommitted" };
-    return v_flex().flex_none().p(8).gap(6).border_b(1).border_color(t.border)
-      .child(h_flex().gap(6).items_center()
-        .children(SCOPES.map(([kind, key]) => this.chip(`scope-${kind}`, names[kind], this.scope.kind === kind, t, (_e, cx) => this.setScope({ kind }, cx), key)))
-        .when(shas.length > 0, (e) => e.child(this.chip("scope-commits", shas.length === 1 ? "1 commit" : `${shas.length} commits`, true, t, (_e, cx) => this.setScope({ kind: "branch" }, cx), "×")))
-        .child(div().flex_1())
-        .child(div().text_size(10.5).text_color(this.visual != null ? t.accent : t.dim).truncate().child(this.visual != null
-          ? "j/k stretches · Enter shows those commits · Esc cancels"
-          : "Click a commit · shift-click for a range")))
-      .child(this.commits.length
-        ? div().h(Math.min(132, this.commits.length * 22)).flex_none().relative()
-          .child(v_virtual_list("br-commits", this.commits.length, 22, (i) => this.commits[i].sha, (range) => this.commits.slice(range.start, range.end).map((c, j) => {
-            const i = range.start + j, on = this.section === "commits" && this.focusedHere && i === this.commitCursor;
-            const picking = this.visual != null && i >= Math.min(this.visual, this.commitCursor) && i <= Math.max(this.visual, this.commitCursor);
-            return h_flex().id(`commit-${c.sha}`).h(22).flex_none().pr(6).gap(8).items_center().rounded(5).cursor_pointer()
-              .when(shas.includes(c.sha), (e) => e.bg(t.selected)).when(picking, (e) => e.bg(t.accent + "33")).hover((s) => s.bg(t.hover))
-              .child(this.marker(on, t))
-              .child(div().w(60).flex_none().text_color(t.accent).font_family(settings().font_family ?? "JetBrains Mono").text_size(11).child(c.short))
-              .child(div().flex_1().min_w(0).truncate().child(c.subject))
-              .child(div().flex_none().text_size(10.5).text_color(t.dim).child(c.when));
-          })).track_scroll(this.commitScroll).on_item_click((sha, cx) => {
-            this.section = "commits"; this.commitCursor = Math.max(0, this.commits.findIndex((c) => c.sha === sha));
-            this.clickCommit(sha, { modifiers: { shift: this.shiftDown } }, cx);
-          }).size_full())
-          .child(Scrollbar.vertical("br-commits").viewport_from_layout().absolute().inset_0())
-        : div().px(6).text_size(11.5).text_color(t.dim).child(this.loading && !this.root ? "Loading commits…" : `No commits on ${this.branch ?? "this branch"} since it left ${this.base ?? "its base"}`));
+    const keys = { branch: "b", last: "", uncommitted: "u" };
+    const body = v_flex().px(2)
+      .child(h_flex().h(LIST_ROW).px(8).gap(6).items_center().text_color(t.muted).text_size(11.5)
+        .child(svg(ICON("git-branch")).size(12).flex_none())
+        .child(div().min_w(0).truncate().child(this.branch ? `${this.root?.split("/").pop()} · ${this.branch} → ${this.base ?? "?"}` : this.loading ? "Loading…" : "")))
+      .children(this.scopeItems().map((s) => {
+        const picked = s.kind === this.scope.kind;
+        const text = s.kind === "commits" ? (s.shas.length === 1 ? "1 commit" : `${s.shas.length} commits`) : names[s.kind];
+        return this.listRow(`scope-${s.kind}`, picked, on, t)
+          .on_click((_e, cx) => { this.section = "scope"; if (!picked) this.setScope(s.kind === "commits" ? s : { kind: s.kind }, cx); cx.notify(); })
+          .child(div().flex_1().min_w(0).truncate().child(text))
+          .when(s.kind === "last" && Boolean(this.last), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.dim).font_family(CODE_FONT()).child(this.last.short)))
+          .when(s.kind === "commits", (e) => e.child(div().id("scope-commits-x").flex_none().px(4).rounded(3).text_color(t.dim).hover((x) => x.text_color(t.foreground))
+            .tooltip("Back to the branch").on_click((_e, cx) => this.setScope({ kind: "branch" }, cx)).child("×")))
+          .when(Boolean(keys[s.kind]), (e) => e.child(div().flex_none().text_size(10).text_color(t.dim).child(keys[s.kind])));
+      }));
+    return this.panel("scope", "1", "Scope", t, body, { grow: false });
   }
 
-  fileList(t) {
-    const label = this.label();
+  filesPanel(t) {
+    const label = this.label(), on = this.section === "files" && this.focusedHere;
     const perFile = new Map();
     for (const c of this.comments) if (c.label === label) perFile.set(c.path, (perFile.get(c.path) ?? 0) + 1);
-    return div().flex_none().h(Math.min(150, Math.max(36, this.files.length * 24 + 12))).relative().p(6).border_b(1).border_color(t.border)
-      .when(this.files.length > 0, (e) => e.child(v_virtual_list("br-files", this.files.length, 24, (i) => this.files[i].path, (range) => this.files.slice(range.start, range.end).map((f) => {
-        const n = perFile.get(f.path) ?? 0, on = this.section === "files" && this.focusedHere && this.open === f.path;
-        const [dir, name] = split(f.path);
-        return h_flex().id(`file-${f.path}`).h(24).flex_none().pr(8).gap(8).items_center().rounded(6).cursor_pointer()
-          .when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
-          .child(this.marker(on, t))
-          .child(div().w(12).flex_none().text_size(10.5).font_semibold().text_color(t[STATUS[f.status]] ?? t.dim).child(f.status))
-          .child(h_flex().flex_1().min_w(0).overflow_hidden()
-            .child(div().flex_shrink(1).min_w(0).truncate().text_color(t.dim).child(dir))
-            .child(div().flex_none().child(name)))
-          .when(n > 0, (e) => e.child(h_flex().flex_none().h(16).px(5).gap(3).items_center().rounded(4).bg(t.accent + "33").text_color(t.accent).text_size(10)
-            .child(svg(ICON("comment")).size(10)).child(String(n))))
-          .when(f.binary, (e) => e.child(div().text_size(10.5).text_color(t.dim).child("binary")))
-          .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`)))
-          .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
-      })).track_scroll(this.fileScroll).on_item_click((path, cx) => { this.section = "files"; this.pickFile(path, cx); }).size_full())
-        .child(Scrollbar.vertical("br-files").viewport_from_layout().absolute().inset_0()))
-      .when(!this.files.length, (e) => e.child(div().p(6).text_size(11.5).text_color(t.dim).child(this.loading && !this.files.length ? "Loading files…" : "No changes in this view")));
+    const add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
+    const body = v_flex().flex_1().min_h(0)
+      .when(this.files.length > 0, (e) => e.child(div().flex_1().min_h(0).relative()
+        .child(v_virtual_list("br-files", this.files.length, LIST_ROW, (i) => this.files[i].path, (range) => this.files.slice(range.start, range.end).map((f) => {
+          const n = perFile.get(f.path) ?? 0;
+          const [dir, name] = split(f.path);
+          return this.listRow(`file-${f.path}`, this.open === f.path, on, t)
+            .child(div().w(12).flex_none().text_size(10.5).font_semibold().text_color(t[STATUS[f.status]] ?? t.dim).child(f.status))
+            .child(h_flex().flex_1().min_w(0).overflow_hidden()
+              .child(div().flex_shrink(1).min_w(0).truncate().text_color(t.dim).child(dir))
+              .child(div().flex_none().child(name)))
+            .when(n > 0, (e) => e.child(h_flex().flex_none().h(16).px(5).gap(3).items_center().rounded(4).bg(tint(t.accent, "33")).text_color(t.accent).text_size(10)
+              .child(svg(ICON("comment")).size(10)).child(String(n))))
+            .when(f.binary, (e) => e.child(div().text_size(10.5).text_color(t.dim).child("binary")))
+            .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`)))
+            .when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
+        })).track_scroll(this.fileScroll).on_item_click((path, cx) => { this.section = "files"; this.side = "files"; this.pickFile(path, cx); cx.notify(); }).size_full())
+        .child(Scrollbar.vertical("br-files").viewport_from_layout().absolute().inset_0())))
+      .when(this.untrackedCut > 0, (e) => e.child(div().flex_none().px(8).py(2).text_size(10.5).text_color(t.dim).child(`${this.untrackedCut} more untracked files not listed`)))
+      .when(!this.files.length, (e) => e.child(this.note(this.loading ? "Loading files…" : "No changes in this scope. [ and ] change it.", t)));
+    const right = this.files.length ? `${this.files.length} · +${add} −${del}` : null;
+    return this.panel("files", "2", "Files", t, body, { right });
   }
 
-  fileBar(t) {
-    const f = this.file();
-    if (!f) return div();
-    const [dir, name] = split(f.path), n = this.contextFor(f.path), full = n >= FULL;
-    const hasFileComment = this.comments.some((c) => c.kind === "file" && c.path === f.path && c.label === this.label());
-    return h_flex().h(32).flex_none().px(10).gap(6).items_center().border_b(1).border_color(t.border).bg(t.surface)
-      .child(h_flex().flex_1().min_w(0).overflow_hidden().text_size(12)
-        .child(div().flex_shrink(1).min_w(0).truncate().text_color(t.dim).child(dir))
-        .child(div().flex_none().font_medium().child(name))
-        .when(f.untracked, (e) => e.child(div().ml(6).flex_none().text_size(10.5).text_color(t.ansi2).child("new, untracked"))))
-      .child(this.iconButton("fb-comment", "comment", hasFileComment ? "File comment ✓" : "File comment", t, (_e, cx) => this.startFile(f.path, cx), { active: hasFileComment, title: "Comment on the whole file (C)" }))
-      .child(this.iconButton("fb-ask", "send", "Ask", t, (_e, cx) => this.askFile(cx), { title: "Ask the agent about this file's diff (a in Files)" }))
-      .child(this.iconButton("fb-more", "expand", n > CONTEXT && !full ? `Context ${n}` : "More context", t, (_e, cx) => this.expand(cx), { title: `Show ${STEP} more lines around each change (e)` }))
-      .child(this.iconButton("fb-full", "expand", "Whole file", t, (_e, cx) => this.expand(cx, true), { active: full, title: "Show the whole file (E)" }));
+  commitsPanel(t) {
+    const shas = this.scope.kind === "commits" ? this.scope.shas : [];
+    const on = this.section === "commits" && this.focusedHere;
+    const body = v_flex().flex_1().min_h(0)
+      .when(this.commits.length > 0, (e) => e.child(div().flex_1().min_h(0).relative()
+        .child(v_virtual_list("br-commits", this.commits.length, LIST_ROW, (i) => this.commits[i].sha, (range) => this.commits.slice(range.start, range.end).map((c, j) => {
+          const i = range.start + j;
+          const picking = this.visual != null && i >= Math.min(this.visual, this.commitCursor) && i <= Math.max(this.visual, this.commitCursor);
+          return this.listRow(`commit-${c.sha}`, i === this.commitCursor && on, on, t)
+            .when(shas.includes(c.sha) && !(i === this.commitCursor && on), (e) => e.bg(tint(t.accent, "26")))
+            .when(picking, (e) => e.bg(tint(t.accent, "33")))
+            .child(div().w(56).flex_none().text_color(shas.includes(c.sha) ? t.accent : t.ansi3).font_family(CODE_FONT()).text_size(11).child(c.short))
+            .child(div().flex_1().min_w(0).truncate().child(c.subject))
+            .child(div().flex_none().text_size(10.5).text_color(t.dim).child(c.when));
+        })).track_scroll(this.commitScroll).on_item_click((sha, cx) => {
+          this.section = "commits"; this.side = "commits"; this.commitCursor = Math.max(0, this.commits.findIndex((c) => c.sha === sha));
+          this.clickCommit(sha, { modifiers: { shift: this.shiftDown } }, cx);
+        }).size_full())
+        .child(Scrollbar.vertical("br-commits").viewport_from_layout().absolute().inset_0())))
+      .when(!this.commits.length, (e) => e.child(this.note(this.loading && !this.root ? "Loading commits…" : `No commits on ${this.branch ?? "this branch"} since it left ${this.base ?? "its base"}`, t)));
+    return this.panel("commits", "3", "Commits", t, body, { right: this.commits.length ? String(this.commits.length) : null });
   }
 
-  diff(t, rows) {
-    return div().id("br-diff-wrap").flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
-      .child(div().id("br-diff-x").size_full().overflow_x_scrollbar()
-        .child(div().w_full().min_w(this.diffWidth ?? 300).h_full().child(v_virtual_list("br-diff", rows.length, rows.map((r) => this.itemSize(r)), (i) => String(i),
-          (range) => rows.slice(range.start, range.end).map((item, i) => this.diffRow(item, t, range.start + i)))
-          .track_scroll(this.scroll).on_item_click((key, cx) => this.clickRow(key, cx))
-          .on_item_secondary_click((key, _e, cx) => this.secondaryRow(key, cx)).size_full())))
-      .child(Scrollbar.vertical("br-diff").viewport_from_layout().absolute().inset_0())
-      .when(!rows.length && Boolean(this.open), (e) => e.child(div().absolute().inset_0().flex().items_center().justify_center().text_color(t.dim).text_size(12).child("Loading diff…")))
-      .when(!this.open && !this.loading, (e) => e.child(div().absolute().inset_0().flex().items_center().justify_center().text_color(t.dim).text_size(12)
-        .child(this.root ? "Nothing to review here. Try another scope (b / l / u)." : "")));
-  }
-
-  composer(t) {
-    const ed = this.editing;
-    if (!ed) {
-      return h_flex().flex_none().h(28).px(12).gap(6).items_center().border_t(1).border_color(t.border).text_size(10.5).text_color(t.dim)
-        .child(div().truncate().child(this.vrow != null
-          ? "Selecting lines: j/k to stretch · c to comment · a to ask · Esc to cancel"
-          : "Click a line to comment · shift-click to stretch · right-click to ask · ? for keys"));
-    }
-    const c = ed.kind === "file" ? { kind: "file" } : ed.a != null && !ed.lost
-      ? R.rangeComment(this.rows, ed.a, ed.b, { path: ed.path, label: ed.label, text: "" }) : null;
-    const where = ed.kind === "file" ? "whole file" : c ? R.linesLabel(c) : ed.outdated ? "outdated lines" : "lines";
-    return v_flex().flex_none().px(10).pt(8).pb(6).gap(6).border_t(1).border_color(t.border).bg(t.surface)
-      .child(h_flex().gap(6).items_center().text_size(11)
-        .child(svg(ICON("comment")).size(12).text_color(t.accent))
-        .child(div().font_medium().child(ed.id ? "Edit comment" : "New comment"))
-        .child(div().min_w(0).truncate().text_color(t.muted).child(`${split(ed.path)[1]} · ${where}`))
-        .when(Boolean(ed.lost), (e) => e.child(div().text_color(t.blocked).child("· those lines changed: click a line to pick again")))
-        .child(div().flex_1())
-        .child(div().text_size(10.5).text_color(t.dim).child(ed.kind === "range" && !ed.id ? "shift-click stretches · ↩ saves · ⇧↩ new line · Esc" : "↩ saves · ⇧↩ new line · Esc")))
-      .child(div().id("br-comment").on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .child(Textarea.new(this.input).w_full().px(10).py(7).rounded(8).border_1().border_color(this.typing === "comment" ? t.accent : t.input).bg(t.background).text_size(12.5)))
-      .child(h_flex().gap(6).items_center()
-        .child(h_flex().id("br-save").h(26).px(12).items_center().rounded(6).cursor_pointer().bg(t.solid).text_color(t.solid_foreground).text_size(12).font_medium()
-          .hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.saveComment(cx)).child(ed.id ? "Save" : "Add comment"))
-        .child(h_flex().id("br-cancel").h(26).px(10).items_center().rounded(6).cursor_pointer().text_size(12).text_color(t.muted)
-          .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.cancelComment(cx)).child("Cancel"))
-        .child(div().flex_1())
-        .when(Boolean(ed.id), (e) => e.child(h_flex().id("br-delete").h(26).px(10).items_center().rounded(6).cursor_pointer().text_size(12).text_color(t.ansi1)
-          .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.deleteComment(ed.id, cx)).child("Delete"))));
-  }
-
-  sendBar(t) {
-    const list = this.agentsList(), a = list[0], n = this.comments.length, label = this.label();
-    const elsewhere = this.comments.filter((c) => c.kind !== "github" && c.label !== label).length;
-    const queued = this.comments.filter((c) => c.kind === "github").length;
-    const can = Boolean(n && !this.preparing);
-    const extra = [elsewhere && `${elsewhere} from other views`, queued && `${queued} GitHub ${queued === 1 ? "thread" : "threads"}`].filter(Boolean).join(" · ");
-    return h_flex().flex_none().px(10).py(8).gap(8).items_center().border_t(1).border_color(t.border)
-      .child(div().text_size(11).text_color(t.dim).flex_none().child("To"))
-      .child(a
-        ? h_flex().id("br-target").h(26).px(9).gap(7).min_w(0).items_center().rounded(6).bg(t.raised).cursor_pointer().hover((s) => s.bg(t.hover))
-          .tooltip(list.length > 1 ? "Next agent (t) · the send dialog lists every agent" : "The send dialog lists every agent")
-          .on_click((_e, cx) => this.nextTarget(cx))
-          .child(div().size(7).flex_none().rounded(4).bg(t[a.status] ?? t.unknown))
-          .child(div().flex_none().text_size(11.5).font_medium().child(a.program?.name ?? a.app ?? a.address))
-          .child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(`${a.space_name} / ${a.tab_name} · ${a.status}`))
-        : div().text_size(11).text_color(t.dim).child("No agent running"))
-      .child(div().flex_1().min_w(0).truncate().text_size(10.5).text_color(t.dim).text_right().child(extra))
-      .child(h_flex().id("br-send").h(28).px(12).gap(6).flex_none().items_center().rounded(7).text_size(12).font_medium()
-        .bg(can ? t.solid : t.raised).text_color(can ? t.solid_foreground : t.dim)
-        .when(can, (e) => e.cursor_pointer().hover((s) => s.opacity(0.88)))
-        .tooltip("Review what's sent, then send (s)")
-        .on_click((_e, cx) => this.send(cx))
-        .child(svg(ICON("send")).size(12))
-        .child(this.preparing ? "Checking…" : n ? `Send review · ${n}` : "Send review"));
-  }
-
-  github(t) {
-    const list = this.shownThreads(), th = list[this.ghCursor];
-    const resolved = this.threads.filter((x) => x.isResolved).length;
-    const note = (text, color = t.dim) => div().p(16).text_size(12).text_color(color).whitespace_normal().child(text);
-    if (this.gh === "error") return v_flex().flex_1().min_h(0).child(note(this.ghError ?? "Couldn't read GitHub", t.blocked));
-    if (this.gh === "none") return v_flex().flex_1().min_h(0).child(note(`No pull request for ${this.branch}. Open one, then press r.`));
-    if (!this.pr || (this.gh === "loading" && !this.threads.length)) return v_flex().flex_1().min_h(0).child(note("Reading review threads…"));
-    const top = h_flex().h(32).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border).text_size(11.5)
-      .child(div().min_w(0).truncate().font_medium().child(`#${this.pr.number} ${this.pr.title}`))
-      .child(div().flex_1())
-      .child(div().text_color(t.dim).flex_none().child(`${this.threads.length - resolved} open${resolved ? ` · ${resolved} resolved` : ""}`))
-      .when(resolved > 0, (e) => e.child(this.iconButton("gh-resolved", "check", this.showResolved ? "Hide resolved" : "Show resolved", t, (_e, cx) => { this.showResolved = !this.showResolved; this.ghCursor = 0; cx.notify(); }, { active: this.showResolved, title: "H" })))
-      .child(this.iconButton("gh-open", "github", "Open PR", t, () => exec("open", [this.pr.url]), { title: this.pr.url }));
-    if (!list.length) return v_flex().flex_1().min_h(0).child(top).child(note(resolved ? "Every thread is resolved. H shows them." : "No review threads on this pull request yet."));
-    const rows = div().h(Math.min(GH_ROW * 5, list.length * GH_ROW)).flex_none().relative().border_b(1).border_color(t.border)
+  githubPanel(t) {
+    const list = this.shownThreads(), on = this.section === "github" && this.focusedHere;
+    const open = this.threads.filter((x) => !x.isResolved).length, fresh = this.threads.filter((x) => !x.isResolved && this.isNew(x)).length;
+    let body;
+    if (this.gh === "error") body = this.note(this.ghError ?? "Couldn't read GitHub", t, t.blocked);
+    else if (this.gh === "none") body = this.note(`No pull request for ${this.branch}. Open one, then press r.`, t);
+    else if (!this.pr || (this.gh === "loading" && !this.threads.length)) body = this.note("Reading review threads…", t);
+    else if (!list.length) body = this.note(this.threads.length ? "Every thread is resolved. H shows them." : "No review threads on this pull request yet.", t);
+    else body = div().flex_1().min_h(0).relative()
       .child(v_virtual_list("br-gh", list.length, GH_ROW, (i) => list[i].id, (range) => list.slice(range.start, range.end).map((x, j) => {
-        const i = range.start + j, on = i === this.ghCursor, first = x.comments[0];
-        return h_flex().id(`gh-${x.id}`).h(GH_ROW).flex_none().pr(10).gap(8).items_center().cursor_pointer()
-          .when(on, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
-          .child(this.marker(on && this.focusedHere, t))
+        const i = range.start + j, first = x.comments[0];
+        return h_flex().id(`gh-${x.id}`).h(GH_ROW).flex_none().pr(8).gap(8).items_center().rounded(3).cursor_pointer()
+          .when(i === this.ghCursor, (e) => e.bg(on ? t.selected : t.raised)).hover((s) => s.bg(t.hover))
+          .child(this.marker(i === this.ghCursor && on, t))
           .child(v_flex().flex_1().min_w(0).gap(2)
             .child(h_flex().gap(6).items_center().text_size(11.5)
               .child(div().min_w(0).truncate().text_color(t.accent).child(`${x.path}${x.line ? `:${x.line}` : ""}`))
@@ -1169,21 +1190,133 @@ export default class BranchReview extends View {
               .child(div().flex_none().font_medium().child(first?.author ?? ""))
               .child(div().min_w(0).truncate().text_color(t.muted).child((first?.body ?? "").replace(/\s+/g, " ")))))
           .child(div().flex_none().text_size(10.5).text_color(t.dim).child(`${x.comments.length} · ${ago(x.comments[x.comments.length - 1]?.at)}`));
-      })).track_scroll(this.ghScroll).on_item_click((id, cx) => { const i = list.findIndex((x) => x.id === id); this.ghCursor = i; this.markSeen(list[i]); cx.notify(); }).size_full())
+      })).track_scroll(this.ghScroll).on_item_click((id, cx) => {
+        const i = list.findIndex((x) => x.id === id);
+        this.ghCursor = i; this.section = "github"; this.side = "github"; this.markSeen(list[i]); cx.notify();
+      }).size_full())
       .child(Scrollbar.vertical("br-gh").viewport_from_layout().absolute().inset_0());
-    return v_flex().flex_1().min_h(0).child(top).child(rows).child(th ? this.threadDetail(th, t) : div());
+    const title = this.pr ? `GitHub #${this.pr.number}` : "GitHub";
+    const right = [open && `${open} open`, fresh && `${fresh} new`].filter(Boolean).join(" · ") || null;
+    return this.panel("github", "4", title, t, body, { right });
+  }
+
+  // The main panel: the picked file's diff, or the picked GitHub thread.
+  mainPanel(t, rows) {
+    if (this.view === "github") {
+      const th = this.shownThreads()[this.ghCursor];
+      const resolved = this.threads.filter((x) => x.isResolved).length;
+      const right = this.pr ? `${this.threads.length - resolved} open${resolved ? ` · ${resolved} resolved${this.showResolved ? " (shown)" : ""}` : ""}` : null;
+      const body = th ? this.threadDetail(th, t) : this.note(this.pr ? "Pick a thread in the GitHub panel." : "", t);
+      return this.panel("diff", "0", this.pr ? `#${this.pr.number} ${this.pr.title}` : "GitHub", t, body, { right });
+    }
+    const f = this.file(), n = f ? this.contextFor(f.path) : CONTEXT;
+    const right = f ? [f.untracked && "new, untracked", n >= FULL ? "whole file" : n > CONTEXT && `context ${n}`, this.label()].filter(Boolean).join(" · ") : null;
+    const body = v_flex().flex_1().min_h(0).child(this.diff(t, rows)).child(this.composer(t));
+    return this.panel("diff", "0", f ? f.path : "Diff", t, body, { right });
+  }
+
+  diff(t, rows) {
+    return div().id("br-diff-wrap").flex_1().min_h(0).relative().font_family(CODE_FONT()).text_size(11)
+      .child(div().id("br-diff-x").size_full().overflow_x_scrollbar()
+        .child(div().w_full().min_w(this.diffWidth ?? 300).h_full().child(v_virtual_list("br-diff", rows.length, rows.map((r) => this.itemSize(r)), (i) => String(i),
+          (range) => rows.slice(range.start, range.end).map((item, i) => this.diffRow(item, t, range.start + i)))
+          .track_scroll(this.scroll).on_item_click((key, cx) => this.clickRow(key, cx))
+          .on_item_secondary_click((key, _e, cx) => this.secondaryRow(key, cx)).size_full())))
+      .child(Scrollbar.vertical("br-diff").viewport_from_layout().absolute().inset_0())
+      .when(!rows.length && Boolean(this.open), (e) => e.child(div().absolute().inset_0().flex().items_center().justify_center().text_color(t.dim).text_size(12).child("Loading diff…")))
+      .when(!this.open && !this.loading, (e) => e.child(div().absolute().inset_0().flex().items_center().justify_center().text_color(t.dim).text_size(12)
+        .child(this.root ? "Nothing to review here. [ and ] change the scope." : "")));
+  }
+
+  // The comment box, at the foot of the main panel while composing.
+  composer(t) {
+    const ed = this.editing;
+    if (!ed) return div();
+    const c = ed.kind === "file" ? { kind: "file" } : ed.a != null && !ed.lost
+      ? R.rangeComment(this.rows, ed.a, ed.b, { path: ed.path, label: ed.label, text: "" }) : null;
+    const where = ed.kind === "file" ? "whole file" : c ? R.linesLabel(c) : ed.outdated ? "outdated lines" : "lines";
+    return v_flex().flex_none().px(10).pt(8).pb(6).gap(6).border_t(1).border_color(t.border).bg(t.surface)
+      .child(h_flex().gap(6).items_center().text_size(11)
+        .child(svg(ICON("comment")).size(12).text_color(t.accent))
+        .child(div().font_medium().child(ed.id ? "Edit comment" : "New comment"))
+        .child(div().min_w(0).truncate().text_color(t.muted).child(`${split(ed.path)[1]} · ${where}`))
+        .when(Boolean(ed.lost), (e) => e.child(div().text_color(t.blocked).child("· those lines changed: click a line to pick again"))))
+      .child(div().id("br-comment").on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .child(Textarea.new(this.input).w_full().px(10).py(7).rounded(6).border_1().border_color(this.typing === "comment" ? t.accent : t.input).bg(t.background).text_size(12.5)))
+      .child(h_flex().gap(6).items_center()
+        .child(h_flex().id("br-save").h(24).px(12).items_center().rounded(5).cursor_pointer().bg(t.solid).text_color(t.solid_foreground).text_size(12).font_medium()
+          .hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.saveComment(cx)).child(ed.id ? "Save" : "Add comment"))
+        .child(h_flex().id("br-cancel").h(24).px(10).items_center().rounded(5).cursor_pointer().text_size(12).text_color(t.muted)
+          .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.cancelComment(cx)).child("Cancel"))
+        .child(div().flex_1())
+        .when(Boolean(ed.id), (e) => e.child(h_flex().id("br-delete").h(24).px(10).items_center().rounded(5).cursor_pointer().text_size(12).text_color(t.ansi1)
+          .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.deleteComment(ed.id, cx)).child("Delete"))));
+  }
+
+  // The hints for what the keyboard does right now, as lazygit's options bar shows them.
+  hints() {
+    if (this.typing === "comment") return [["enter", "save"], ["shift-enter", "new line"], ["esc", "cancel"]];
+    if (this.typing === "reply") return [["cmd-enter", "post to GitHub"], ["esc", "cancel"]];
+    if (this.vrow != null) return [["j k", "stretch"], ["c", "comment"], ["a", "ask"], ["esc", "cancel"]];
+    if (this.visual != null) return [["j k", "stretch"], ["enter", "show those commits"], ["esc", "cancel"]];
+    const own = PANEL_KEYS[this.onThreads() ? "github" : this.section] ?? [];
+    return [...own.slice(0, 5), ["s", "send"], ["?", "keys"]];
+  }
+
+  bottomBar(t) {
+    const list = this.agentsList(), a = list[0], n = this.comments.length, label = this.label();
+    const elsewhere = this.comments.filter((c) => c.kind !== "github" && c.label !== label).length;
+    const queued = this.comments.filter((c) => c.kind === "github").length;
+    const can = Boolean(n && !this.preparing);
+    const extra = [elsewhere && `${elsewhere} from other views`, queued && `${queued} GitHub`].filter(Boolean).join(" · ");
+    return h_flex().flex_none().h(30).px(10).gap(10).items_center().text_size(11)
+      .child(h_flex().flex_1().min_w(0).gap(12).overflow_hidden()
+        .children(this.hints().map(([k, d]) => h_flex().flex_none().gap(4).child(div().text_color(t.accent).child(k)).child(div().text_color(t.dim).child(d)))))
+      .when(Boolean(extra), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.dim).child(extra)))
+      .child(a
+        ? h_flex().id("br-target").h(22).px(8).gap(6).flex_none().max_w(260).items_center().rounded(4).bg(t.raised).cursor_pointer().hover((s) => s.bg(t.hover))
+          .tooltip(list.length > 1 ? "Next agent (t) · the send dialog lists every agent" : "The send dialog lists every agent")
+          .on_click((_e, cx) => this.nextTarget(cx))
+          .child(div().size(7).flex_none().rounded(4).bg(t[a.status] ?? t.unknown))
+          .child(div().flex_none().font_medium().child(a.program?.name ?? a.app ?? a.address))
+          .child(div().min_w(0).truncate().text_color(t.dim).child(`${a.space_name} / ${a.tab_name} · ${a.status}`))
+        : div().flex_none().text_color(t.dim).child("No agent running"))
+      .child(h_flex().id("br-send").h(22).px(10).gap(6).flex_none().items_center().rounded(4).font_medium()
+        .bg(can ? t.solid : t.raised).text_color(can ? t.solid_foreground : t.dim)
+        .when(can, (e) => e.cursor_pointer().hover((s) => s.opacity(0.88)))
+        .tooltip("Review what's sent, then send (s)")
+        .on_click((_e, cx) => this.send(cx))
+        .child(svg(ICON("send")).size(11))
+        .child(this.preparing ? "Checking…" : n ? `Send review · ${n}` : "Send review"));
+  }
+
+  // ?: the focused panel's keys and the global ones, in a box over the pane.
+  helpPopup(t) {
+    const name = this.onThreads() ? "github" : this.section;
+    const title = name === "diff" ? "Main panel" : PANELS.find(([p]) => p === name)?.[2] ?? "Keys";
+    const group = (heading, keys) => v_flex().flex_1().min_w(0).gap(4)
+      .child(div().text_size(10.5).font_semibold().text_color(t.dim).child(heading.toUpperCase()))
+      .children(keys.map(([k, d]) => h_flex().gap(10).items_center()
+        .child(div().w(96).flex_none().text_color(t.accent).font_family(CODE_FONT()).text_size(11).child(k))
+        .child(div().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(d))));
+    return div().id("br-help").absolute().inset_0().flex().items_center().justify_center().bg(tint(t.background, "aa"))
+      .on_mouse_down("left", (_e, cx) => { this.showHelp = false; cx.stop_propagation(); cx.notify(); })
+      .child(v_flex().w(Math.min(640, this.width - 40)).p(14).gap(12).rounded(6).bg(t.surface).border_1().border_color(t.accent)
+        .child(h_flex().items_center().child(div().font_semibold().text_size(12.5).child(`Keys · ${title}`)).child(div().flex_1()).child(div().text_size(10.5).text_color(t.dim).child("esc or ? closes")))
+        .child(h_flex().gap(24).items_start().child(group(title, PANEL_KEYS[name] ?? [])).child(group("Everywhere", GLOBAL_KEYS))));
   }
 
   threadDetail(th, t) {
     const queued = this.queued(th), replying = this.replying?.id === th.id;
     const action = (id, icon, label, onClick, active, title) => this.iconButton(id, icon, label, t, onClick, { active, title });
     return v_flex().id(`ghd-${th.id}`).flex_1().min_h(0)
-      .child(h_flex().flex_none().px(12).py(6).gap(4).items_center().border_b(1).border_color(t.border).bg(t.surface)
+      .child(h_flex().flex_none().px(8).pb(6).gap(4).items_center().border_b(1).border_color(t.border)
+        .child(div().min_w(0).truncate().text_color(t.accent).text_size(11.5).child(`${th.path}${th.line ? `:${th.line}` : ""}`))
+        .child(div().flex_1())
         .child(action("gh-fix", "send", "Fix", (_e, cx) => this.fixThread(th, cx), false, "Send this thread to the agent (f)"))
         .child(action("gh-queue", queued ? "check" : "comment", queued ? "In review" : "Add to review", (_e, cx) => this.toggleQueued(th, cx), queued, "Send it with your review comments (i)"))
         .child(action("gh-reply", "comment", "Reply", (_e, cx) => this.startReply(th, cx), replying, "Reply on GitHub (R)"))
         .child(action("gh-show", "chevron-right", "Show in diff", (_e, cx) => this.jumpToThread(th, cx), false, "Enter"))
-        .child(div().flex_1())
         .when(Boolean(th.url), (e) => e.child(action("gh-browser", "github", "Open", () => exec("open", [th.url]), false, "o"))))
       .child(v_flex().id("gh-comments").flex_1().min_h(0).overflow_y_scrollbar().px(14).py(10).gap(12)
         .children(th.comments.map((m, i) => v_flex().gap(4)
@@ -1194,17 +1327,16 @@ export default class BranchReview extends View {
       .when(replying, (e) => e.child(v_flex().flex_none().px(10).pt(8).pb(8).gap(6).border_t(1).border_color(t.border).bg(t.surface)
         .child(h_flex().gap(6).items_center().text_size(11)
           .child(svg(ICON("github")).size(12)).child(div().font_medium().child("Reply on GitHub"))
-          .child(div().text_color(t.dim).child("· posts publicly as your gh account"))
-          .child(div().flex_1()).child(div().text_size(10.5).text_color(t.dim).child("⌘↩ posts · Esc")))
+          .child(div().text_color(t.dim).child("· posts publicly as your gh account")))
         .child(div().id("gh-reply-box").on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .child(Textarea.new(this.replyInput).w_full().px(10).py(7).rounded(8).border_1().border_color(this.typing === "reply" ? t.accent : t.input).bg(t.background).text_size(12.5)))
+          .child(Textarea.new(this.replyInput).w_full().px(10).py(7).rounded(6).border_1().border_color(this.typing === "reply" ? t.accent : t.input).bg(t.background).text_size(12.5)))
         .when(Boolean(this.replyError), (e) => e.child(div().text_size(11.5).text_color(t.ansi1).whitespace_normal().child(this.replyError)))
         .child(h_flex().gap(6).items_center()
-          .child(h_flex().id("gh-post").h(26).px(12).items_center().rounded(6).text_size(12).font_medium()
+          .child(h_flex().id("gh-post").h(24).px(12).items_center().rounded(5).text_size(12).font_medium()
             .bg(this.posting ? t.raised : t.solid).text_color(this.posting ? t.dim : t.solid_foreground)
             .when(!this.posting, (e) => e.cursor_pointer().hover((s) => s.opacity(0.88)).on_click((_e, cx) => this.postReply(cx)))
             .child(this.posting ? "Posting…" : "Post to GitHub"))
-          .child(h_flex().id("gh-cancel").h(26).px(10).items_center().rounded(6).cursor_pointer().text_size(12).text_color(t.muted)
+          .child(h_flex().id("gh-cancel").h(24).px(10).items_center().rounded(5).cursor_pointer().text_size(12).text_color(t.muted)
             .hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.cancelReply(cx)).child("Cancel")))));
   }
 
@@ -1215,26 +1347,30 @@ export default class BranchReview extends View {
     this.focusedHere = !this.typing;
     const rows = (this.display = this.displayRows());
     if (this.cursor >= rows.length) this.cursor = Math.max(0, rows.length - 1);
-    const github = this.view === "github";
 
-    return v_flex().id("branch-review").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12).track_focus(this.handle)
+    return v_flex().id("branch-review").relative().size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(12).track_focus(this.handle)
       .on_size_change((size, cx) => { if (Math.abs((size?.width ?? 0) - this.width) > 4) { this.width = size.width; cx.notify(); } })
       .on_key_down((e, cx) => this.onKey(e, cx))
       // List rows report clicks without modifiers, so shift is read from the press.
       .on_mouse_down("left", (e) => { this.shiftDown = Boolean(e?.modifiers?.shift); if (!this.typing) this.handle.focus(); })
-      .child(this.header(t))
-      .when(Boolean(this.showHelp), (e) => e.child(this.help(t)))
-      .when(Boolean(this.error), (e) => e.child(h_flex().px(12).py(6).gap(8).items_center().bg(t.ansi1 + "18").border_b(1).border_color(t.border)
+      // A splitter drag follows the pointer anywhere over the pane and ends on release or on leaving it.
+      .on_mouse_move((e, cx) => this.dragTo(e, cx))
+      .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
+      .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
+      .when(Boolean(this.error), (e) => e.child(h_flex().flex_none().px(12).py(5).gap(8).items_center().bg(tint(t.ansi1, "18")).border_b(1).border_color(t.border)
         .child(div().flex_1().text_size(11.5).text_color(t.ansi1).whitespace_normal().child(this.error))
         .child(this.iconButton("err-x", "x", null, t, (_e, cx) => { this.error = null; cx.notify(); }))))
-      .when(github, (e) => e.child(this.github(t)))
-      .when(!github, (e) => e
-        .child(this.scopes(t))
-        .child(this.fileList(t))
-        .when(this.untrackedCut > 0, (e) => e.child(div().px(12).py(3).text_size(10.5).text_color(t.dim).child(`${this.untrackedCut} more untracked files not listed`)))
-        .child(this.fileBar(t))
-        .child(this.diff(t, rows))
-        .child(this.composer(t)))
-      .child(this.sendBar(t));
+      .child(h_flex().flex_1().min_h(0).px(4).pt(2).items_stretch()
+        .child(v_flex().w(this.leftWidth()).flex_none().min_h(0)
+          .child(this.scopePanel(t))
+          .child(div().h(3).flex_none())
+          .child(this.filesPanel(t))
+          .child(this.splitter("row", t, "files", "commits"))
+          .child(this.commitsPanel(t))
+          .when(this.hasGithub(), (e) => e.child(this.splitter("row", t, "commits", "github")).child(this.githubPanel(t))))
+        .child(this.splitter("col", t))
+        .child(v_flex().flex_1().min_w(0).min_h(0).child(this.mainPanel(t, rows))))
+      .child(this.bottomBar(t))
+      .when(Boolean(this.showHelp), (e) => e.child(this.helpPopup(t)));
   }
 }

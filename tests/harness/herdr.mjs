@@ -25,9 +25,10 @@ export const nextCommand = () => new Promise(() => {});
 export const agents = () => world.agents;
 export const terminals = () => world.terminals;
 export const spaces = () => [{ id: "s1", active: true, machine: null, folder: "/" }];
-export const panes = () => [];
-export const focused = () => ({ space: "s1", tab: "tb", pane: null });
-export const theme = () => new Proxy({}, { get: () => "#336699" });
+export const panes = () => world.panes ?? [];
+export const focused = () => world.focused ?? { space: "s1", tab: "tb", pane: null };
+// The background carries an alpha, as it does with window_opacity below 1.
+export const theme = () => new Proxy({}, { get: (_t, k) => (k === "background" ? "#00000066" : "#336699") });
 export const settings = () => ({});
 export const props = () => world.props;
 export const shared = (k) => world.shared.get(k);

@@ -54,6 +54,23 @@ test("opens on the branch view with its commits and files", async () => {
   assert.match(text, /Send review/);
 });
 
+test("number keys, h/l and tab move between panels; [ ] change the scope; esc leaves the diff", async () => {
+  assert.equal(view.section, "files");
+  key("1"); assert.equal(view.section, "scope");
+  key("l"); assert.equal(view.section, "files");
+  key("tab"); assert.equal(view.section, "commits");
+  key("h"); key("h"); assert.equal(view.section, "scope");
+  key("h"); assert.equal(view.section, "diff", "wraps to the main panel (no GitHub panel without a PR)");
+  key("escape"); assert.equal(view.section, "scope", "esc goes back to the side panel");
+  key("j"); await settle(); assert.equal(view.scope.kind, "last");
+  key("]"); await settle(); assert.equal(view.scope.kind, "uncommitted");
+  key("]"); await settle(); assert.equal(view.scope.kind, "branch");
+  key("2"); key("enter"); assert.equal(view.section, "diff");
+  assert.match(draw(), /\[2\]/);
+  key("?"); assert.ok(view.showHelp); assert.match(draw(), /Keys · Main panel/);
+  key("?"); assert.ok(!view.showHelp);
+});
+
 test("j/k over files, then v j c makes a range comment that renders", async () => {
   view.section = "files"; key("j"); await settle();
   assert.equal(view.open, "src.js");
@@ -167,7 +184,9 @@ test("every view renders with the GitHub view and help open", async () => {
     comments: [{ id: "x", author: "kim", body: "Use a constant?", at: new Date().toISOString() }] }];
   view.pr = { number: 7, title: "Feat", url: "https://github.com/o/r/pull/7", host: "github.com" }; view.gh = "ready";
   view.showHelp = true; draw();
-  key("p"); draw();
+  key("p"); assert.equal(view.view, "diff", "the keys popup takes every key but esc and ?");
+  key("escape"); assert.equal(view.showHelp, false);
+  key("4"); draw();
   assert.equal(view.view, "github");
   key("i"); assert.equal(view.comments.filter((c) => c.kind === "github").length, 1);
   key("R"); assert.equal(view.replying.id, "T"); draw();
@@ -185,9 +204,50 @@ test("the GitHub view loads a PR's threads through gh", async () => {
     { id: "G1", path: "src.js", line: 3, isResolved: false, isOutdated: false, diffSide: "RIGHT", comments: { nodes: [{ id: "c", body: "hm", author: { login: "kim" } }] } }] } } } } };
   world.gh = (args) => ({ code: 0, stderr: "", stdout: JSON.stringify(args[0] === "pr" ? pr : page) });
   view.pr = null; view.threads = []; view.gh = "idle";
-  key("p"); await settle();
+  key("2"); key("p"); await settle();
   assert.equal(view.gh, "ready", view.ghError);
   assert.equal(view.threads[0].id, "G1");
   draw();
   world.gh = null;
+});
+
+test("q closes the tab when the pane is alone in it, else only the pane", async () => {
+  world.panes = [{ pane: "pm", mod: "branch-review", tab: "tr", focused: true }];
+  view.closePane();
+  assert.deepEqual(log.runs.at(-1), ["tab.close", { id: "tr" }]);
+  world.panes.push({ pane: "pt", terminal: "t1", tab: "tr", focused: false });
+  view.closePane();
+  assert.deepEqual(log.runs.at(-1), ["pane.close", { pane: "pm" }]);
+  world.panes = null;
+});
+
+test("ctrl-b shift-v opens a review tab named for the branch, with the pane's folder", async () => {
+  const { default: Open } = await import("../mods/branch-review-open/main.js");
+  world.panes = [{ pane: "p1", terminal: "t1", tab: "tb", cwd: repo, branch: "feat/x", focused: true }];
+  world.focused = { space: "s1", tab: "tb", pane: "p1" };
+  world.props = { overlay: "ov" };
+  new Open().init({}, cx); await settle();
+  assert.deepEqual(log.runs.at(-1), ["tab.new", { name: "review: feat/x", space: "s1", mod: "branch-review", props: { folder: repo, on: null, space: "s1" } }]);
+  world.panes = null; world.focused = null;
+});
+
+test("splitters resize the side column and trade height between side panels, and are kept per repo", async () => {
+  view.width = 1200;
+  view.drag = { id: "split-col", kind: "col", x: 100, from: 300 };
+  view.dragTo({ position: { x: 160, y: 0 } }, cx);
+  assert.equal(view.leftWidth(), 360);
+  view.dragTo({ position: { x: 5000, y: 0 } }, cx);
+  assert.equal(view.leftWidth(), 1200 - 320, "the main panel keeps 320px");
+  view.endDrag(cx);
+  assert.equal(view.drag, null);
+  view.drag = { id: "split-files-commits", kind: "row", y: 50, a: "files", b: "commits", ha: 200, hb: 200 };
+  view.dragTo({ position: { x: 0, y: 130 } }, cx);
+  assert.deepEqual([view.layout.weights.files, view.layout.weights.commits], [280, 120]);
+  view.dragTo({ position: { x: 0, y: 900 } }, cx);
+  assert.deepEqual([view.layout.weights.files, view.layout.weights.commits], [340, 60], "each panel keeps 60px");
+  view.endDrag(cx);
+  const kept = JSON.parse(localStorage.getItem(`layout:${view.root}`));
+  assert.equal(kept.left, 1200 - 320);
+  assert.equal(kept.weights.files, 340);
+  view.showHelp = true; draw(); view.showHelp = false;
 });
