@@ -145,6 +145,19 @@ test("a asks about the cursor line through the dialog; nothing is saved", async 
   assert.equal(view.comments.length, n);
 });
 
+test("X clears every comment on the branch and U brings them all back", async () => {
+  const before = view.comments.map((c) => c.id).sort();
+  assert.ok(before.length >= 2, "needs comments from earlier tests");
+  assert.match(draw(), /^Clear$/m, "the bottom bar has a Clear button");
+  key("X");
+  assert.equal(view.comments.length, 0);
+  assert.equal(JSON.parse(localStorage.getItem(view.storeKey())).length, 0, "the clear is saved");
+  assert.match(log.notes.at(-1).title, new RegExp(`${before.length} comments cleared`));
+  key("U");
+  assert.deepEqual(view.comments.map((c) => c.id).sort(), before);
+  assert.equal(JSON.parse(localStorage.getItem(view.storeKey())).length, before.length);
+});
+
 test("s checks comments and opens the review dialog; the dialog's sent key clears them", async () => {
   key("s"); await settle();
   const o = log.overlays.at(-1);

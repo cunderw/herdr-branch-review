@@ -29,7 +29,7 @@ const SCOPES = ["branch", "last", "uncommitted"];
 const PANELS = [["scope", "1", "Scope"], ["files", "2", "Files"], ["commits", "3", "Commits"], ["github", "4", "GitHub"]];
 
 // Keys per panel, for the bottom bar (the first few) and the ? popup (all of them).
-const GLOBAL_KEYS = [["1-4 0", "jump to a panel"], ["h l / tab", "previous / next panel"], ["[ ]", "previous / next scope"], ["s", "send the review"], ["t", "next recipient"], ["r", "refresh"], ["?", "keys"], ["q", "close"]];
+const GLOBAL_KEYS = [["1-4 0", "jump to a panel"], ["h l / tab", "previous / next panel"], ["[ ]", "previous / next scope"], ["s", "send the review"], ["X", "clear all comments (U undoes)"], ["t", "next recipient"], ["r", "refresh"], ["?", "keys"], ["q", "close"]];
 const PANEL_KEYS = {
   scope: [["j k", "pick a scope"], ["b u", "branch / uncommitted"], ["enter", "go to files"]],
   files: [["j k", "pick a file"], ["enter", "go to the diff"], ["c", "comment on the file"], ["a", "ask about the file"], ["e E", "more context / whole file"]],
@@ -443,8 +443,21 @@ export default class BranchReview extends View {
     this.comments = this.comments.filter((x) => x.id !== id);
     if (this.editing?.id === id) { this.editing = null; this.input.set_value(""); this.typing = null; this.handle.focus(); }
     this.saveComments(); this.placeComments();
-    this.undo = c;
+    this.undo = [c];
     notify({ title: "Comment deleted", body: `${c.text.slice(0, 80)} · U brings it back`, level: "info", timeout: 4000 });
+    cx.notify();
+  }
+
+  // Drops every comment on this branch, in every view, including queued GitHub threads.
+  clearComments(cx) {
+    if (!this.comments.length) return;
+    const all = this.comments;
+    this.comments = [];
+    if (this.editing?.id) { this.editing = null; this.input.set_value(""); this.typing = null; this.handle.focus(); }
+    this.saveComments(); this.placeComments();
+    this.undo = all;
+    const n = all.length;
+    notify({ title: `${n} ${n === 1 ? "comment" : "comments"} cleared`, body: "U brings them back", level: "info", timeout: 4000 });
     cx.notify();
   }
 
@@ -863,7 +876,8 @@ export default class BranchReview extends View {
       "c": () => this.comment(cx),
       "C": () => this.startFile(this.open, cx),
       "x": () => { const c = this.commentAtCursor(); if (c) this.deleteComment(c.id, cx); },
-      "U": () => { if (this.undo) { this.comments.push(this.undo); this.undo = null; this.saveComments(); this.placeComments(); cx.notify(); } },
+      "X": () => this.clearComments(cx),
+      "U": () => { if (this.undo) { this.comments.push(...this.undo); this.undo = null; this.saveComments(); this.placeComments(); cx.notify(); } },
       "a": () => this.ask(cx),
       "e": () => this.expand(cx),
       "E": () => this.expand(cx, true),
@@ -1281,6 +1295,13 @@ export default class BranchReview extends View {
           .child(div().flex_none().font_medium().child(a.program?.name ?? a.app ?? a.address))
           .child(div().min_w(0).truncate().text_color(t.dim).child(`${a.space_name} / ${a.tab_name} · ${a.status}`))
         : div().flex_none().text_color(t.dim).child("No agent running"))
+      .child(h_flex().id("br-clear").h(22).px(10).gap(6).flex_none().items_center().rounded(4)
+        .bg(t.raised).text_color(n ? t.foreground : t.dim)
+        .when(Boolean(n), (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)))
+        .tooltip("Clear every comment on this branch (X) · U brings them back")
+        .on_click((_e, cx) => this.clearComments(cx))
+        .child(svg(ICON("x")).size(11))
+        .child("Clear"))
       .child(h_flex().id("br-send").h(22).px(10).gap(6).flex_none().items_center().rounded(4).font_medium()
         .bg(can ? t.solid : t.raised).text_color(can ? t.solid_foreground : t.dim)
         .when(can, (e) => e.cursor_pointer().hover((s) => s.opacity(0.88)))
